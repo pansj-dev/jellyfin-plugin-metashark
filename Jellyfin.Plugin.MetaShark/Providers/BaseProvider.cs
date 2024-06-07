@@ -19,6 +19,7 @@ using TMDbLib.Objects.General;
 using Jellyfin.Plugin.MetaShark.Configuration;
 using Jellyfin.Plugin.MetaShark.Core;
 using Microsoft.AspNetCore.Http;
+using MediaBrowser.Controller.Entities.TV;
 
 namespace Jellyfin.Plugin.MetaShark.Providers
 {
@@ -50,6 +51,7 @@ namespace Jellyfin.Plugin.MetaShark.Providers
 
         protected Regex regMetaSourcePrefix = new Regex(@"^\[.+\]", RegexOptions.Compiled);
         protected Regex regSeasonNameSuffix = new Regex(@"\s第[0-9一二三四五六七八九十]+?季$|\sSeason\s\d+?$|(?<![0-9a-zA-Z])\d$", RegexOptions.Compiled);
+        protected Regex regDoubanIdAttribute = new Regex(@"\[(?:douban|doubanid)-(\d+?)\]", RegexOptions.Compiled);
 
         protected PluginConfiguration config
         {
@@ -107,10 +109,16 @@ namespace Jellyfin.Plugin.MetaShark.Providers
         protected async Task<string?> GuessByDoubanAsync(ItemLookupInfo info, CancellationToken cancellationToken)
         {
             var fileName = GetOriginalFileName(info);
+            // 从文件名属性格式获取，如[douban-12345]或[doubanid-12345]
+            var doubanId = this.regDoubanIdAttribute.FirstMatchGroup(fileName);
+            if (!string.IsNullOrWhiteSpace(doubanId))
+            {
+                this.Log($"Found douban [id] by attr: {doubanId}");
+                return doubanId;
+            }
             var parseResult = NameParser.Parse(fileName);
             var searchName = !string.IsNullOrEmpty(parseResult.ChineseName) ? parseResult.ChineseName : parseResult.Name;
             info.Year = parseResult.Year;  // 默认parser对anime年份会解析出错，以anitomy为准
-
 
             this.Log($"GuessByDouban of [name]: {info.Name} [file_name]: {fileName} [year]: {info.Year} [search name]: {searchName}");
             List<DoubanSubject> result;
@@ -125,13 +133,13 @@ namespace Jellyfin.Plugin.MetaShark.Providers
                     item = result.Where(x => x.Year == info.Year && x.Name == searchName).FirstOrDefault();
                     if (item != null)
                     {
-                        this.Log($"GuessByDouban found -> {item.Name}({item.Sid}) (suggest)");
+                        this.Log($"Found douban [id]: {item.Name}({item.Sid}) (suggest)");
                         return item.Sid;
                     }
                     item = result.Where(x => x.Year == info.Year).FirstOrDefault();
                     if (item != null)
                     {
-                        this.Log($"GuessByDouban found -> {item.Name}({item.Sid}) (suggest)");
+                        this.Log($"Found douban [id]: {item.Name}({item.Sid}) (suggest)");
                         return item.Sid;
                     }
                 }
@@ -169,7 +177,7 @@ namespace Jellyfin.Plugin.MetaShark.Providers
             item = result.Where(x => x.Category == cat).FirstOrDefault();
             if (item != null)
             {
-                this.Log($"GuessByDouban found -> {item.Name}({item.Sid})");
+                this.Log($"Found douban [id] by first match: {item.Name}({item.Sid})");
                 return item.Sid;
             }
 
@@ -394,8 +402,8 @@ namespace Jellyfin.Plugin.MetaShark.Providers
 
         public int? GuessSeasonNumberByDirectoryName(string path)
         {
-            // TODO: 有时series name中会带有季信息
-            // 当没有season级目录时，path为空，直接返回
+            // TODO: 有时 series name 中会带有季信息
+            // 当没有 season 级目录时，或 season 文件夹特殊不规范命名时，会解析不到 seasonNumber，这时 path 为空，直接返回
             if (string.IsNullOrEmpty(path))
             {
                 this.Log($"Season path is empty!");
@@ -409,6 +417,7 @@ namespace Jellyfin.Plugin.MetaShark.Providers
                 return null;
             }
 
+            // 中文季名
             var regSeason = new Regex(@"第([0-9零一二三四五六七八九]+?)(季|部)", RegexOptions.Compiled);
             var match = regSeason.Match(fileName);
             if (match.Success && match.Groups.Count > 1)
@@ -425,12 +434,26 @@ namespace Jellyfin.Plugin.MetaShark.Providers
                 }
             }
 
+            // SXX 季名
+            regSeason = new Regex(@"(?<![a-z])S(\d\d?)(?![0-9a-z])", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+            match = regSeason.Match(fileName);
+            if (match.Success && match.Groups.Count > 1)
+            {
+                var seasonNumber = match.Groups[1].Value.ToInt();
+                if (seasonNumber > 0)
+                {
+                    this.Log($"Found season number of filename: {fileName} seasonNumber: {seasonNumber}");
+                    return seasonNumber;
+                }
+            }
 
+
+            // 动漫季特殊命名
             var seasonNameMap = new Dictionary<string, int>() {
-                {@"[ ._](I|1st|S01|S1)[ ._]", 1},
-                {@"[ ._](II|2nd|S02|S2)[ ._]", 2},
-                {@"[ ._](III|3rd|S03|S3)[ ._]", 3},
-                {@"[ ._](IIII|4th|S04|S4)[ ._]", 3},
+                {@"[ ._](I|1st)[ ._]", 1},
+                {@"[ ._](II|2nd)[ ._]", 2},
+                {@"[ ._](III|3rd)[ ._]", 3},
+                {@"[ ._](IIII|4th)[ ._]", 3},
             };
 
             foreach (var entry in seasonNameMap)
@@ -600,7 +623,47 @@ namespace Jellyfin.Plugin.MetaShark.Providers
             }
         }
 
-        protected string RemoveSeasonSubfix(string name)
+        protected string? GetOriginalSeasonPath(EpisodeInfo info)
+        {
+            if (info.Path == null) {
+                return null;
+            }
+
+            var seasonPath = Path.GetDirectoryName(info.Path);
+            var item = this._libraryManager.FindByPath(seasonPath, true);
+            // 没有季文件夹
+            if (item is Series) {
+                return null;
+            }
+
+            return seasonPath;
+        }
+
+        protected bool IsVirtualSeason(EpisodeInfo info)
+        {
+            if (info.Path == null)
+            {
+                return false;
+            }
+
+            var seasonPath = Path.GetDirectoryName(info.Path);
+            var parent = this._libraryManager.FindByPath(seasonPath, true);
+            // 没有季文件夹
+            if (parent is Series) {
+                return true;
+            }
+
+            var seriesPath = Path.GetDirectoryName(seasonPath);
+            var series = this._libraryManager.FindByPath(seriesPath, true);
+            // 季文件夹不规范，没法识别
+            if (series is Series && parent is not Season) {
+                return true;
+            }
+
+            return false;
+        }
+
+        protected string RemoveSeasonSuffix(string name)
         {
             return regSeasonNameSuffix.Replace(name, "");
         }
